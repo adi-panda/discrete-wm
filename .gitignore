@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model checkpoints
+checkpoints/
+
+# Logs
+logs/
+
+# Figures / evaluation outputs
+figures/
+
+# Data files
+*.npz
+discrete_wm/data/
+
+# Environment
+.env
+.venv/
+venv/
