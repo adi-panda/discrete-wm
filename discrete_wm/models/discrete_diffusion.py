@@ -231,18 +231,20 @@ class DiscreteWorldModel(nn.Module):
     Uses cosine masking schedule and iterative unmasking for generation.
 
     Token grid: 16x16 = 256 tokens per frame (from 4x4 patches of 64x64 frames).
+    Supports multi-frame context via cross-attention (context_frames=1 or 4).
     """
     def __init__(
         self,
-        vocab_size=512,         # Codebook size for patch tokens
-        grid_h=16,              # Token grid height
-        grid_w=16,              # Token grid width
-        d_model=512,            # Transformer dimension
-        n_layers=8,             # Number of transformer layers
-        n_heads=8,              # Attention heads
-        n_actions=4,            # Number of Atari actions
+        vocab_size=512,
+        grid_h=16,
+        grid_w=16,
+        d_model=512,
+        n_layers=8,
+        n_heads=8,
+        n_actions=4,
         dropout=0.0,
-        cond_dim=512,           # Conditioning dimension
+        cond_dim=512,
+        context_frames=1,
     ):
         super().__init__()
 
@@ -251,109 +253,124 @@ class DiscreteWorldModel(nn.Module):
         self.grid_w = grid_w
         self.n_tokens = grid_h * grid_w  # 256
         self.d_model = d_model
-        self.mask_token_id = vocab_size  # MASK token ID
+        self.mask_token_id = vocab_size
+        self.context_frames = context_frames
 
-        # Token embedding: vocab_size + 1 for MASK token
         self.token_embed = nn.Embedding(vocab_size + 1, d_model)
-
-        # Positional encoding
         self.pos_enc = LearnedPositionalEncoding2D(d_model, grid_h, grid_w)
 
-        # Action conditioning
+        if context_frames > 1:
+            self.frame_pos_embed = nn.Embedding(context_frames, d_model)
+
         self.action_embed = nn.Sequential(
             nn.Embedding(n_actions, cond_dim),
             nn.SiLU(),
             nn.Linear(cond_dim, cond_dim),
         )
 
-        # Timestep embedding (for masking ratio / diffusion time)
         self.time_embed = nn.Sequential(
             nn.Linear(1, cond_dim),
             nn.SiLU(),
             nn.Linear(cond_dim, cond_dim),
         )
 
-        # Condition projection
         self.cond_proj = nn.Sequential(
             nn.Linear(cond_dim, cond_dim),
             nn.SiLU(),
             nn.Linear(cond_dim, cond_dim),
         )
 
-        # Previous frame context projection
         self.prev_frame_proj = nn.Linear(d_model, d_model)
 
-        # Transformer layers
         self.layers = nn.ModuleList([
             TransformerBlock(d_model, n_heads, cond_dim, dropout)
             for _ in range(n_layers)
         ])
 
-        # Output head
         self.output_norm = nn.LayerNorm(d_model)
         self.output_head = nn.Linear(d_model, vocab_size)
 
-    def forward(self, masked_tokens, prev_tokens, action, mask_ratio):
-        """
-        Forward pass.
+    def _build_context(self, prev_tokens, device):
+        """Build cross-attention context from previous frame tokens.
 
         Args:
-            masked_tokens: [B, N] - current frame tokens with some masked
-            prev_tokens: [B, N] - previous frame tokens (unmasked)
-            action: [B] - action taken
-            mask_ratio: [B] - masking ratio (diffusion timestep)
+            prev_tokens: [B, N] for single frame, [B, C, N] for multi-frame
+        Returns:
+            context: [B, C*N, D]
+        """
+        pos = self.pos_enc(self.grid_h, self.grid_w, device)
 
+        if self.context_frames == 1:
+            if prev_tokens.dim() == 3:
+                prev_tokens = prev_tokens[:, 0]
+            context = self.token_embed(prev_tokens)
+            context = self.prev_frame_proj(context + pos.unsqueeze(0))
+            return context
+
+        B = prev_tokens.shape[0]
+        C = self.context_frames
+        N = self.n_tokens
+
+        if prev_tokens.dim() == 2:
+            prev_tokens = prev_tokens.unsqueeze(1).expand(-1, C, -1)
+
+        all_contexts = []
+        for f in range(C):
+            emb = self.token_embed(prev_tokens[:, f])
+            emb = emb + pos.unsqueeze(0) + self.frame_pos_embed.weight[f].unsqueeze(0).unsqueeze(0)
+            all_contexts.append(emb)
+        context = torch.cat(all_contexts, dim=1)  # [B, C*N, D]
+        context = self.prev_frame_proj(context)
+        return context
+
+    def forward(self, masked_tokens, prev_tokens, action, mask_ratio):
+        """
+        Args:
+            masked_tokens: [B, N]
+            prev_tokens: [B, N] or [B, C, N] for multi-frame context
+            action: [B]
+            mask_ratio: [B]
         Returns:
             logits: [B, N, vocab_size]
         """
         B = masked_tokens.shape[0]
         device = masked_tokens.device
 
-        # Embed tokens
-        x = self.token_embed(masked_tokens)  # [B, N, D]
-
-        # Add positional encoding
+        x = self.token_embed(masked_tokens)
         pos = self.pos_enc(self.grid_h, self.grid_w, device)
         x = x + pos.unsqueeze(0)
 
-        # Embed previous frame as context
-        context = self.token_embed(prev_tokens)
-        context = self.prev_frame_proj(context + pos.unsqueeze(0))
+        context = self._build_context(prev_tokens, device)
 
-        # Build conditioning signal
         act_emb = self.action_embed(action)
         if mask_ratio.dim() == 1:
             mask_ratio = mask_ratio.unsqueeze(-1)
         time_emb = self.time_embed(mask_ratio.float())
         cond = self.cond_proj(act_emb + time_emb)
 
-        # Transformer layers
         for layer in self.layers:
             x = layer(x, cond, context)
 
-        # Output logits
         x = self.output_norm(x)
-        logits = self.output_head(x)  # [B, N, vocab_size]
+        logits = self.output_head(x)
 
         return logits
 
     @torch.no_grad()
     def generate(self, prev_tokens, action, num_steps=8, temperature=1.0, device='cuda'):
         """
-        Generate next frame via iterative unmasking.
-
         Args:
-            prev_tokens: [B, N] - previous frame tokens
-            action: [B] - action taken
-            num_steps: Number of unmasking steps
-            temperature: Sampling temperature
-
+            prev_tokens: [B, N] or [B, C, N]
+            action: [B]
         Returns:
-            tokens: [B, N] - generated frame tokens
+            tokens: [B, N]
         """
-        B, N = prev_tokens.shape
+        if prev_tokens.dim() == 3:
+            B = prev_tokens.shape[0]
+            N = prev_tokens.shape[2]
+        else:
+            B, N = prev_tokens.shape
 
-        # Start fully masked
         tokens = torch.full((B, N), self.mask_token_id, device=device, dtype=torch.long)
         is_masked = torch.ones(B, N, dtype=torch.bool, device=device)
 
@@ -361,24 +378,19 @@ class DiscreteWorldModel(nn.Module):
             ratio = 1.0 - (step + 1) / num_steps
             mask_ratio_tensor = torch.full((B,), max(ratio, 0.0), device=device)
 
-            # Get predictions
             logits = self.forward(tokens, prev_tokens, action, mask_ratio_tensor)
 
-            # Sample from predicted distribution
-            probs = F.softmax(logits / temperature, dim=-1)  # [B, N, V]
+            probs = F.softmax(logits / temperature, dim=-1)
             sampled = torch.multinomial(probs.view(-1, self.vocab_size), 1).view(B, N)
-            confidence = probs.max(dim=-1).values  # [B, N]
+            confidence = probs.max(dim=-1).values
 
-            # Only consider masked positions
             confidence = confidence.masked_fill(~is_masked, -float('inf'))
 
             if step < num_steps - 1:
-                # Determine how many to unmask
                 n_masked = is_masked.sum(dim=1).float()
                 target_masked = max(ratio, 0.0) * N
                 n_to_unmask = (n_masked - target_masked).clamp(min=1).long()
 
-                # Unmask top-confidence positions
                 for b in range(B):
                     masked_idx = is_masked[b].nonzero(as_tuple=True)[0]
                     if len(masked_idx) == 0:
@@ -390,7 +402,6 @@ class DiscreteWorldModel(nn.Module):
                     tokens[b, unmask_pos] = sampled[b, unmask_pos]
                     is_masked[b, unmask_pos] = False
             else:
-                # Last step: unmask everything remaining
                 tokens = torch.where(is_masked, sampled, tokens)
                 is_masked.fill_(False)
 

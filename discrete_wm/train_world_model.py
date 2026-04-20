@@ -24,12 +24,16 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from models.discrete_diffusion import DiscreteWorldModel, PatchVQVAE
-from utils import AtariFramePairDataset, AtariTokenizedDataset, cosine_mask_schedule
+from utils import AtariFramePairDataset, AtariTokenizedDataset, AtariMultiFrameTokenizedDataset, cosine_mask_schedule
 from hf_utils import push_checkpoint, ensure_repo
 
 
 def pretokenize_dataset(args):
-    """Pre-tokenize the entire dataset using the trained VQ-VAE."""
+    """Pre-tokenize the entire dataset using the trained VQ-VAE.
+
+    When --context-frames > 1, saves all_tokens with episode_ends for
+    AtariMultiFrameTokenizedDataset. Otherwise saves pair format for backward compat.
+    """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Load tokenizer
@@ -49,6 +53,7 @@ def pretokenize_dataset(args):
     frames = torch.from_numpy(data['frames'])
     actions = data['actions']
     num_actions = int(data['num_actions'])
+    episode_ends = data.get('episode_ends', None)
 
     print(f"Tokenizing {len(frames)} frames...")
 
@@ -60,28 +65,38 @@ def pretokenize_dataset(args):
             tokens, _, _, _ = tokenizer.encode(batch)
             all_tokens.append(tokens.cpu().numpy())
 
-    all_tokens = np.concatenate(all_tokens, axis=0)  # [N, num_patches]
+    all_tokens = np.concatenate(all_tokens, axis=0)
     print(f"Tokenized: {all_tokens.shape}, vocab range: [{all_tokens.min()}, {all_tokens.max()}]")
 
-    # Build pairs
-    prev_tokens = all_tokens[:-1]  # [N-1, num_patches]
-    next_tokens = all_tokens[1:]   # [N-1, num_patches]
+    context_frames = getattr(args, 'context_frames', 1)
 
-    # Trim to match actions length
-    n = min(len(prev_tokens), len(actions))
-    prev_tokens = prev_tokens[:n]
-    next_tokens = next_tokens[:n]
-    actions_trimmed = actions[:n]
+    if context_frames > 1 and episode_ends is not None:
+        save_path = os.path.join(os.path.dirname(args.raw_data), 'tokenized_data.npz')
+        np.savez_compressed(
+            save_path,
+            all_tokens=all_tokens.astype(np.int16),
+            actions=actions,
+            episode_ends=episode_ends,
+            num_actions=num_actions,
+        )
+        print(f"Saved multi-frame tokenized data to {save_path}")
+    else:
+        prev_tokens = all_tokens[:-1]
+        next_tokens = all_tokens[1:]
+        n = min(len(prev_tokens), len(actions))
+        prev_tokens = prev_tokens[:n]
+        next_tokens = next_tokens[:n]
+        actions_trimmed = actions[:n]
 
-    save_path = os.path.join(os.path.dirname(args.raw_data), 'tokenized_data.npz')
-    np.savez_compressed(
-        save_path,
-        prev_tokens=prev_tokens.astype(np.int16),
-        next_tokens=next_tokens.astype(np.int16),
-        actions=actions_trimmed,
-        num_actions=num_actions,
-    )
-    print(f"Saved tokenized data to {save_path}")
+        save_path = os.path.join(os.path.dirname(args.raw_data), 'tokenized_data.npz')
+        np.savez_compressed(
+            save_path,
+            prev_tokens=prev_tokens.astype(np.int16),
+            next_tokens=next_tokens.astype(np.int16),
+            actions=actions_trimmed,
+            num_actions=num_actions,
+        )
+        print(f"Saved tokenized data to {save_path}")
     return save_path
 
 
@@ -120,12 +135,16 @@ def save_sample_images(model, tokenizer, dataset, device, step, save_dir,
         pred_tokens = model.generate(prev_tokens, actions, num_steps=num_steps,
                                       temperature=0.9, device=device)
 
-        # Decode all with tokenizer
-        prev_frames = tokenizer.decode_tokens(prev_tokens)
+        # For display, show only the last context frame if multi-frame
+        if prev_tokens.dim() == 3:
+            display_prev = prev_tokens[:, -1]
+        else:
+            display_prev = prev_tokens
+
+        prev_frames = tokenizer.decode_tokens(display_prev)
         gt_frames = tokenizer.decode_tokens(gt_tokens)
         pred_frames = tokenizer.decode_tokens(pred_tokens)
 
-        # Convert to uint8
         prev_uint8 = ((prev_frames.clamp(-1, 1) + 1) / 2 * 255).byte().cpu().numpy()
         gt_uint8 = ((gt_frames.clamp(-1, 1) + 1) / 2 * 255).byte().cpu().numpy()
         pred_uint8 = ((pred_frames.clamp(-1, 1) + 1) / 2 * 255).byte().cpu().numpy()
@@ -156,15 +175,26 @@ def train(args):
     tokenizer.load_state_dict(tok_ckpt['model'])
     tokenizer.eval()
 
+    context_frames = getattr(args, 'context_frames', 1)
+
     # Dataset
-    dataset = AtariTokenizedDataset(args.data)
+    if context_frames > 1:
+        split_path = getattr(args, 'split_path', None)
+        dataset = AtariMultiFrameTokenizedDataset(
+            args.data, split_path=split_path, split='train',
+            context_frames=context_frames,
+        )
+        # For grid_size, peek at token shape
+        grid_size = int(math.sqrt(dataset.all_tokens.shape[1]))
+    else:
+        dataset = AtariTokenizedDataset(args.data)
+        grid_size = int(math.sqrt(dataset.prev_tokens.shape[1]))
+
     dataloader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=4, pin_memory=True, drop_last=True,
         persistent_workers=True,
     )
-
-    grid_size = int(math.sqrt(dataset.prev_tokens.shape[1]))
 
     # Model
     model = DiscreteWorldModel(
@@ -177,6 +207,7 @@ def train(args):
         n_actions=dataset.num_actions,
         dropout=args.dropout,
         cond_dim=args.d_model,
+        context_frames=context_frames,
     ).to(device)
 
     num_params = sum(p.numel() for p in model.parameters())
@@ -357,6 +388,10 @@ if __name__ == "__main__":
     parser.add_argument("--n-layers", type=int, default=8)
     parser.add_argument("--n-heads", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--context-frames", type=int, default=1)
+
+    # Multi-frame dataset
+    parser.add_argument("--split-path", default=None, help="Path to train_test_split.json")
 
     # Training
     parser.add_argument("--batch-size", type=int, default=128)
