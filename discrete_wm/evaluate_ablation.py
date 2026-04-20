@@ -430,9 +430,9 @@ def load_diamond_wm(ckpt_path, device, num_actions=4):
     denoiser = Denoiser(denoiser_cfg).to(device)
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    from utils import extract_state_dict
+    from collections import OrderedDict
     if isinstance(ckpt, dict) and any(k.startswith('denoiser.') for k in ckpt.keys()):
-        den_sd = extract_state_dict(ckpt, 'denoiser')
+        den_sd = OrderedDict({k.split(".", 1)[1]: v for k, v in ckpt.items() if k.startswith("denoiser")})
         denoiser.load_state_dict(den_sd)
     else:
         denoiser.load_state_dict(ckpt)
