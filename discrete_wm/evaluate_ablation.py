@@ -269,6 +269,21 @@ def eval_fps(adapter, test_contexts, device, n_warmup=10, n_measure=100):
 # Data preparation
 # ============================================================
 
+def _build_frame_to_action_map(frames, actions, episode_ends):
+    """Build a mapping from frame index to (action_value, is_valid)."""
+    episode_starts = np.concatenate([[0], episode_ends[:-1]])
+    frame_actions = np.full(len(frames), -1, dtype=np.int64)
+    action_offset = 0
+    for ep_idx in range(len(episode_ends)):
+        start = episode_starts[ep_idx]
+        end = episode_ends[ep_idx]
+        n_actions = end - start - 1
+        for j in range(n_actions):
+            frame_actions[start + j] = actions[action_offset + j]
+        action_offset += n_actions
+    return frame_actions, episode_starts
+
+
 def prepare_test_data(data_path, split_path, context_frames=4, max_samples=1000):
     data = np.load(data_path)
     frames = data['frames']
@@ -278,7 +293,7 @@ def prepare_test_data(data_path, split_path, context_frames=4, max_samples=1000)
     with open(split_path) as f:
         split = json.load(f)
 
-    episode_starts = np.concatenate([[0], episode_ends[:-1]])
+    frame_actions, episode_starts = _build_frame_to_action_map(frames, actions, episode_ends)
 
     contexts = []
     acts = []
@@ -290,12 +305,14 @@ def prepare_test_data(data_path, split_path, context_frames=4, max_samples=1000)
         for i in range(start + context_frames, end - 1):
             if len(contexts) >= max_samples:
                 break
+            if frame_actions[i] < 0:
+                continue
             ctx = []
             for c in range(context_frames - 1, -1, -1):
                 src = max(start, i - c)
                 ctx.append(torch.from_numpy(frames[src].copy()))
             contexts.append(torch.stack(ctx, dim=0))
-            acts.append(torch.tensor(actions[i], dtype=torch.long))
+            acts.append(torch.tensor(int(frame_actions[i]), dtype=torch.long))
             gts.append(torch.from_numpy(frames[i + 1].copy()))
         if len(contexts) >= max_samples:
             break
@@ -312,7 +329,7 @@ def prepare_rollout_data(data_path, split_path, context_frames=4, num_seeds=10, 
     with open(split_path) as f:
         split = json.load(f)
 
-    episode_starts = np.concatenate([[0], episode_ends[:-1]])
+    frame_actions, episode_starts = _build_frame_to_action_map(frames, actions, episode_ends)
 
     seed_contexts = []
     seed_actions = []
@@ -324,7 +341,7 @@ def prepare_rollout_data(data_path, split_path, context_frames=4, num_seeds=10, 
         start = episode_starts[ep_idx]
         end = episode_ends[ep_idx]
         ep_len = end - start
-        if ep_len < context_frames + horizon:
+        if ep_len < context_frames + horizon + 1:
             continue
 
         seed_idx = start + context_frames
@@ -334,8 +351,11 @@ def prepare_rollout_data(data_path, split_path, context_frames=4, num_seeds=10, 
             ctx.append(torch.from_numpy(frames[src].copy()))
         seed_contexts.append(torch.stack(ctx, dim=0))
 
-        act_seq = torch.from_numpy(actions[seed_idx:seed_idx + horizon].copy()).long()
-        seed_actions.append(act_seq)
+        act_vals = []
+        for j in range(horizon):
+            a = frame_actions[seed_idx + j]
+            act_vals.append(a if a >= 0 else 0)
+        seed_actions.append(torch.tensor(act_vals, dtype=torch.long))
 
         gt_seq = torch.from_numpy(frames[seed_idx + 1:seed_idx + 1 + horizon].copy())
         gt_frames_list.append(gt_seq)
