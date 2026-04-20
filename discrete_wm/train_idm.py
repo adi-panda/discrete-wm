@@ -45,19 +45,19 @@ class IDM(nn.Module):
 
 
 class FramePairDataset(Dataset):
-    def __init__(self, frames, actions, indices):
+    def __init__(self, frames, pairs):
+        """pairs: list of (frame_idx, action_idx) tuples"""
         self.frames = frames
-        self.actions = actions
-        self.indices = indices
+        self.pairs = pairs
 
     def __len__(self):
-        return len(self.indices)
+        return len(self.pairs)
 
     def __getitem__(self, idx):
-        i = self.indices[idx]
-        prev = torch.from_numpy(self.frames[i].copy()).float().permute(2, 0, 1) / 255.0
-        nxt = torch.from_numpy(self.frames[i + 1].copy()).float().permute(2, 0, 1) / 255.0
-        action = torch.tensor(self.actions[i], dtype=torch.long)
+        frame_idx, action_val = self.pairs[idx]
+        prev = torch.from_numpy(self.frames[frame_idx].copy()).float().permute(2, 0, 1) / 255.0
+        nxt = torch.from_numpy(self.frames[frame_idx + 1].copy()).float().permute(2, 0, 1) / 255.0
+        action = torch.tensor(action_val, dtype=torch.long)
         return prev, nxt, action
 
 
@@ -84,20 +84,27 @@ def main():
 
     episode_starts = np.concatenate([[0], episode_ends[:-1]])
 
-    def get_valid_indices(ep_list):
-        indices = []
-        for ep_idx in ep_list:
+    def get_valid_pairs(ep_list):
+        """Return (frame_idx, action_value) pairs respecting episode boundaries."""
+        pairs = []
+        action_offset = 0
+        for ep_idx in range(len(episode_ends)):
             start = episode_starts[ep_idx]
             end = episode_ends[ep_idx]
-            for i in range(start, end - 1):
-                indices.append(i)
-        return indices
+            n_actions = end - start - 1
+            if ep_idx in ep_list:
+                for j in range(n_actions):
+                    pairs.append((start + j, int(actions[action_offset + j])))
+            action_offset += n_actions
+        return pairs
 
-    train_indices = get_valid_indices(split['train_episodes'])
-    test_indices = get_valid_indices(split['test_episodes'])
+    train_set = set(split['train_episodes'])
+    test_set = set(split['test_episodes'])
+    train_pairs = get_valid_pairs(train_set)
+    test_pairs = get_valid_pairs(test_set)
 
-    train_ds = FramePairDataset(frames, actions, train_indices)
-    test_ds = FramePairDataset(frames, actions, test_indices)
+    train_ds = FramePairDataset(frames, train_pairs)
+    test_ds = FramePairDataset(frames, test_pairs)
 
     train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                           num_workers=4, pin_memory=True, drop_last=True, persistent_workers=True)

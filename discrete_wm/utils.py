@@ -59,29 +59,42 @@ class AtariMultiFrameTokenizedDataset(Dataset):
 
     def __init__(self, tokens_path, split_path=None, split='train', context_frames=4):
         data = np.load(tokens_path)
-        all_tokens = torch.from_numpy(data['all_tokens'].astype(np.int64))  # [N_frames, num_patches]
-        all_actions = torch.from_numpy(data['actions'].astype(np.int64))    # [N_transitions]
-        episode_ends = data['episode_ends'].astype(np.int64)                # [E] frame indices
+        all_tokens = torch.from_numpy(data['all_tokens'].astype(np.int64))
+        all_actions_flat = data['actions'].astype(np.int64)
+        episode_ends = data['episode_ends'].astype(np.int64)
         self.num_actions = int(data['num_actions'])
         self.context_frames = context_frames
 
         if split_path is not None:
             with open(split_path) as f:
                 split_info = json.load(f)
-            ep_indices = split_info[f'{split}_episodes']
+            ep_indices = set(split_info[f'{split}_episodes'])
         else:
-            ep_indices = list(range(len(episode_ends)))
+            ep_indices = set(range(len(episode_ends)))
 
         episode_starts = np.concatenate([[0], episode_ends[:-1]])
+
+        frame_to_action = np.full(len(all_tokens), -1, dtype=np.int64)
+        action_offset = 0
+        for ep_idx in range(len(episode_ends)):
+            start = episode_starts[ep_idx]
+            end = episode_ends[ep_idx]
+            n_actions = end - start - 1
+            for j in range(n_actions):
+                frame_to_action[start + j] = all_actions_flat[action_offset + j]
+            action_offset += n_actions
+
         self.valid_indices = []
-        for ep_idx in ep_indices:
+        for ep_idx in range(len(episode_ends)):
+            if ep_idx not in ep_indices:
+                continue
             start = episode_starts[ep_idx]
             end = episode_ends[ep_idx]
             for frame_idx in range(start, end - 1):
                 self.valid_indices.append(frame_idx)
 
         self.all_tokens = all_tokens
-        self.all_actions = all_actions
+        self.frame_to_action = torch.from_numpy(frame_to_action)
         self.episode_starts = episode_starts
         self.episode_ends = episode_ends
 
@@ -111,7 +124,7 @@ class AtariMultiFrameTokenizedDataset(Dataset):
 
         prev_tokens = torch.stack(prev_frames, dim=0)  # [C, N]
         next_tokens = self.all_tokens[frame_idx + 1]    # [N]
-        action = self.all_actions[frame_idx]
+        action = self.frame_to_action[frame_idx]
 
         return prev_tokens, action, next_tokens
 

@@ -294,3 +294,120 @@ Note: Speed roughly 2x faster than 100k eval — likely due to GPU being fully w
 - **Real-time capable**: 49.4 FPS at 4 denoising steps (3.3x Atari real-time)
 - **All 7 success criteria met**
 
+
+---
+
+# EXPERIMENT: breakout-ablation-v1
+**Started**: 2026-04-20
+
+## Phase 0: Setup (ablation-v1)
+**Timestamp**: 2026-04-20
+
+### Environment
+- GPU: NVIDIA H100 80GB HBM3 (85.3 GB)
+- DIAMOND repo: `/root/research/diamond/` — src/ and config/ verified
+- Discrete WM repo: `/root/research/discrete_wm/` — all source files present
+- Previous breakout-v1 data: UNTOUCHED
+
+### New ablation_v1 paths created
+- Data: `/vast/adi/discrete_wm/data/ablation_v1/`
+- Checkpoints: `/vast/adi/discrete_wm/checkpoints/ablation_v1/`
+- Figures: `/vast/adi/discrete_wm/figures/ablation_v1/`
+- Logs: `/vast/adi/discrete_wm/logs/ablation_v1/`
+
+### Goal
+Head-to-head ablation: discrete diffusion WM vs DIAMOND, same data, same eval harness.
+Fixes from breakout-v1: trained-policy data, 4-frame context, actual DIAMOND run.
+
+---
+
+
+## Phase 1: Data Collection
+**Timestamp**: 2026-04-20
+
+### Collection Stats
+- Agent: DIAMOND pretrained Breakout actor-critic (from HF: eloialonso/diamond, atari_100k/models/Breakout.pt)
+- Epsilon: 0.05
+- Transitions: 100,000
+- Episodes: 84
+- Episode lengths: mean=1190.5, min=37, max=2108
+- Episode rewards: mean=150.6, min=1, max=423 (trained agent actually plays!)
+- Mean consecutive frame diff: 0.28 (up from ~0.2 with random policy)
+- Action histogram: NOOP=32918, FIRE=31851, RIGHT=16950, LEFT=18281
+
+### Train/Test Split
+- Train: 76 episodes (89,820 steps)
+- Test: 8 episodes (10,264 steps)
+- Split by episode, saved to train_test_split.json
+
+### Saved Formats
+- Our format: `/vast/adi/discrete_wm/data/ablation_v1/atari_data.npz`
+  - Frames: (100084, 64, 64, 3), Actions: (100000,), episode_ends: (84,)
+- DIAMOND format: `/vast/adi/discrete_wm/data/ablation_v1/diamond_dataset/{train,test}/`
+  - 76 train episodes, 8 test episodes as .pt files with info.pt metadata
+- Sanity GIFs: `/vast/adi/discrete_wm/figures/ablation_v1/collection_sanity/`
+
+---
+
+
+## Phase 4: IDM Training (completed early)
+**Timestamp**: 2026-04-20
+
+### Configuration
+- Architecture: 4-conv CNN (6→64→128→256→256, stride 2) + global avg pool + linear(4)
+- Parameters: 963,652
+- Training: 20k steps, bs=256, lr=3e-4, AdamW
+- Data: 89,744 train pairs, 10,256 test pairs (same train/test split as WMs)
+
+### Results
+- Test accuracy: **89.9%** (target was ≥85% ✅)
+- Macro F1: **0.92**
+- Per-class:
+  - NOOP: F1=0.85 (precision=0.91, recall=0.81)
+  - FIRE: F1=0.84 (precision=0.80, recall=0.90)
+  - RIGHT: F1=1.00 (precision=1.00, recall=0.99)
+  - LEFT: F1=0.99 (precision=0.98, recall=0.99)
+- LEFT/RIGHT nearly perfect; NOOP/FIRE slightly confused (expected — similar visual effects)
+- Checkpoint: `/vast/adi/discrete_wm/checkpoints/ablation_v1/idm.pt`
+
+---
+
+## Phase 2.1: VQ-VAE Tokenizer Retrain
+**Timestamp**: 2026-04-20
+
+### Decision
+Old breakout-v1 tokenizer only achieved 33.2 dB PSNR on agent-collected frames (below 45 dB threshold).
+Retraining on new data for 50k steps. Training in progress.
+
+
+### Tokenizer Retrain Results
+- Retrained tokenizer: PSNR **49.1 dB** on agent-collected frames (above 45 dB ✅)
+- Codebook utilization: 315/512 (62%)
+- Checkpoint: `/vast/adi/discrete_wm/checkpoints/ablation_v1/tokenizer_final.pt`
+
+## Phase 2.3: Pre-tokenization
+- Tokenized 100,084 frames in 3 seconds
+- Saved multi-frame format: all_tokens [100084, 256], episode_ends, actions
+- Path: `/vast/adi/discrete_wm/data/ablation_v1/tokenized_data.npz`
+
+## Phase 2.4: WM Training (in progress)
+**Timestamp**: 2026-04-20
+
+- Model: 48.1M params, 4-frame context, 8L/512D/8H
+- Data: 89,744 train pairs (4-frame context, multi-frame dataset)
+- Config: 100k steps, bs=64, lr=1e-4, cosine schedule
+- Speed: ~10 steps/sec → ~2.7h estimated
+- GPU memory: ~17 GB (leaving room for DIAMOND)
+
+## Phase 3: DIAMOND Training (in progress, parallel)
+**Timestamp**: 2026-04-20
+
+- Using standalone training script (bypasses Hydra/WandB/collectors)
+- Denoiser: 4.4M params, channels=[64,64,64,64], num_steps_conditioning=4
+- Data: 76 train episodes, 89,440 segments
+- Config: 100k steps, bs=32, lr=1e-4, cosine schedule
+- Speed: ~17 steps/sec → ~1.6h estimated
+- Both models training on same GPU: 21 GB / 82 GB total, 100% util
+
+---
+
