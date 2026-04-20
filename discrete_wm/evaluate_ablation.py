@@ -12,10 +12,28 @@ metrics on identical test frames:
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
 from abc import ABC, abstractmethod
+from collections import OrderedDict
+
+# Import DIAMOND models FIRST (before our 'models' package shadows theirs)
+_diamond_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'diamond', 'src')
+sys.path.insert(0, _diamond_src)
+from models.diffusion import Denoiser, DenoiserConfig, DiffusionSampler, DiffusionSamplerConfig
+from models.diffusion.inner_model import InnerModelConfig
+sys.path.remove(_diamond_src)
+
+# Import our models via importlib to avoid namespace conflict with diamond's 'models'
+import importlib.util as _ilu
+_dd_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', 'discrete_diffusion.py')
+_dd_spec = _ilu.spec_from_file_location('discrete_diffusion', _dd_path)
+_dd_mod = _ilu.module_from_spec(_dd_spec)
+_dd_spec.loader.exec_module(_dd_mod)
+DiscreteWorldModel = _dd_mod.DiscreteWorldModel
+PatchVQVAE = _dd_mod.PatchVQVAE
 
 import imageio
 import lpips
@@ -25,7 +43,7 @@ import torch.nn.functional as F
 from sklearn.metrics import f1_score
 from tqdm import tqdm
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'diamond', 'src'))
+from train_idm import IDM
 
 
 # ============================================================
@@ -114,7 +132,6 @@ class DiamondWMAdapter(WMAdapter):
         self.device = device
         self.num_steps_denoising = num_steps_denoising
 
-        from models.diffusion import DiffusionSampler, DiffusionSamplerConfig
         cfg = DiffusionSamplerConfig(
             num_steps_denoising=num_steps_denoising,
             sigma_min=2e-3,
@@ -246,23 +263,117 @@ def eval_idm_f1(adapter, idm, test_contexts, test_actions, device, n_samples=500
     return {'idm_f1': f1, 'idm_acc': acc}
 
 
+def eval_fvd(adapter, seed_contexts, seed_actions_seq, gt_frames_seq, device,
+             rollout_len=16, n_rollouts=50):
+    from torchvision.models import inception_v3
+    from scipy.linalg import sqrtm
+
+    inception = inception_v3(weights='IMAGENET1K_V1', transform_input=False).to(device)
+    inception.fc = torch.nn.Identity()
+    inception.eval()
+
+    def extract_features(video_frames):
+        feats = []
+        for frame in video_frames:
+            img = frame.float().permute(2, 0, 1).unsqueeze(0).to(device) / 255.0
+            img = F.interpolate(img, size=(299, 299), mode='bilinear', align_corners=False)
+            img = img.expand(-1, 3, -1, -1)
+            with torch.no_grad():
+                f = inception(img)
+            feats.append(f.squeeze().cpu().numpy())
+        return np.mean(feats, axis=0)
+
+    real_feats = []
+    gen_feats = []
+    n = min(n_rollouts, len(seed_contexts))
+
+    for i in tqdm(range(n), desc=f"FVD rollouts ({adapter.name})"):
+        ctx = seed_contexts[i:i+1]
+        gt_seq = gt_frames_seq[i]
+        act_seq = seed_actions_seq[i]
+        T = min(rollout_len, len(act_seq))
+
+        gt_video = [gt_seq[t] for t in range(T)]
+        real_feats.append(extract_features(gt_video))
+
+        gen_video = []
+        context_list = [ctx[0, c] for c in range(ctx.shape[1])]
+        for t in range(T):
+            ctx_t = torch.stack(context_list[-4:], dim=0).unsqueeze(0)
+            act_t = act_seq[t:t+1]
+            pred = adapter.predict_next_frame(ctx_t, act_t)
+            gen_video.append(pred[0])
+            context_list.append(pred[0])
+        gen_feats.append(extract_features(gen_video))
+
+    real_feats = np.array(real_feats)
+    gen_feats = np.array(gen_feats)
+
+    mu_r, sigma_r = real_feats.mean(axis=0), np.cov(real_feats, rowvar=False)
+    mu_g, sigma_g = gen_feats.mean(axis=0), np.cov(gen_feats, rowvar=False)
+
+    eps = 1e-6
+    sigma_r += np.eye(sigma_r.shape[0]) * eps
+    sigma_g += np.eye(sigma_g.shape[0]) * eps
+
+    diff = mu_r - mu_g
+    covmean = sqrtm(sigma_r @ sigma_g)
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    fvd = float(diff @ diff + np.trace(sigma_r + sigma_g - 2 * covmean))
+    return {'fvd': fvd}
+
+
 def eval_fps(adapter, test_contexts, device, n_warmup=10, n_measure=100):
     ctx = test_contexts[0:1]
     act = torch.tensor([1], dtype=torch.long)
 
-    for _ in range(n_warmup):
-        adapter.predict_next_frame(ctx, act)
+    if isinstance(adapter, DiscreteWMAdapter):
+        step_counts = [4, 8, 16]
+    elif isinstance(adapter, DiamondWMAdapter):
+        step_counts = [3, 5, 10]
+    else:
+        step_counts = [None]
 
-    torch.cuda.synchronize()
-    start = time.time()
-    for _ in range(n_measure):
-        adapter.predict_next_frame(ctx, act)
-    torch.cuda.synchronize()
-    elapsed = time.time() - start
+    results = {}
+    for steps in step_counts:
+        if steps is not None:
+            if isinstance(adapter, DiscreteWMAdapter):
+                adapter.gen_steps = steps
+            elif isinstance(adapter, DiamondWMAdapter):
+                adapter.num_steps_denoising = steps
+                cfg = DiffusionSamplerConfig(
+                    num_steps_denoising=steps, sigma_min=2e-3,
+                    sigma_max=5.0, rho=7, order=1,
+                )
+                adapter.sampler = DiffusionSampler(adapter.denoiser, cfg)
 
-    ms_per_frame = elapsed / n_measure * 1000
-    fps = n_measure / elapsed
-    return {'fps': fps, 'ms_per_frame': ms_per_frame}
+        for _ in range(n_warmup):
+            adapter.predict_next_frame(ctx, act)
+
+        torch.cuda.synchronize()
+        start = time.time()
+        for _ in range(n_measure):
+            adapter.predict_next_frame(ctx, act)
+        torch.cuda.synchronize()
+        elapsed = time.time() - start
+
+        ms = elapsed / n_measure * 1000
+        fps_val = n_measure / elapsed
+        label = f"_{steps}steps" if steps else ""
+        results[f'fps{label}'] = fps_val
+        results[f'ms_per_frame{label}'] = ms
+
+    if isinstance(adapter, DiscreteWMAdapter):
+        adapter.gen_steps = 8
+    elif isinstance(adapter, DiamondWMAdapter):
+        cfg = DiffusionSamplerConfig(
+            num_steps_denoising=3, sigma_min=2e-3,
+            sigma_max=5.0, rho=7, order=1,
+        )
+        adapter.sampler = DiffusionSampler(adapter.denoiser, cfg)
+
+    return results
 
 
 # ============================================================
@@ -320,7 +431,7 @@ def prepare_test_data(data_path, split_path, context_frames=4, max_samples=1000)
     return torch.stack(contexts), torch.stack(acts), torch.stack(gts)
 
 
-def prepare_rollout_data(data_path, split_path, context_frames=4, num_seeds=10, horizon=50):
+def prepare_rollout_data(data_path, split_path, context_frames=4, num_seeds=50, horizon=50):
     data = np.load(data_path)
     frames = data['frames']
     actions = data['actions']
@@ -335,6 +446,7 @@ def prepare_rollout_data(data_path, split_path, context_frames=4, num_seeds=10, 
     seed_actions = []
     gt_frames_list = []
 
+    stride = max(horizon // 2, 1)
     for ep_idx in split['test_episodes']:
         if len(seed_contexts) >= num_seeds:
             break
@@ -344,21 +456,23 @@ def prepare_rollout_data(data_path, split_path, context_frames=4, num_seeds=10, 
         if ep_len < context_frames + horizon + 1:
             continue
 
-        seed_idx = start + context_frames
-        ctx = []
-        for c in range(context_frames - 1, -1, -1):
-            src = max(start, seed_idx - c)
-            ctx.append(torch.from_numpy(frames[src].copy()))
-        seed_contexts.append(torch.stack(ctx, dim=0))
+        for seed_idx in range(start + context_frames, end - horizon - 1, stride):
+            if len(seed_contexts) >= num_seeds:
+                break
+            ctx = []
+            for c in range(context_frames - 1, -1, -1):
+                src = max(start, seed_idx - c)
+                ctx.append(torch.from_numpy(frames[src].copy()))
+            seed_contexts.append(torch.stack(ctx, dim=0))
 
-        act_vals = []
-        for j in range(horizon):
-            a = frame_actions[seed_idx + j]
-            act_vals.append(a if a >= 0 else 0)
-        seed_actions.append(torch.tensor(act_vals, dtype=torch.long))
+            act_vals = []
+            for j in range(horizon):
+                a = frame_actions[seed_idx + j]
+                act_vals.append(a if a >= 0 else 0)
+            seed_actions.append(torch.tensor(act_vals, dtype=torch.long))
 
-        gt_seq = torch.from_numpy(frames[seed_idx + 1:seed_idx + 1 + horizon].copy())
-        gt_frames_list.append(gt_seq)
+            gt_seq = torch.from_numpy(frames[seed_idx + 1:seed_idx + 1 + horizon].copy())
+            gt_frames_list.append(gt_seq)
 
     return (
         torch.stack(seed_contexts),
@@ -372,8 +486,6 @@ def prepare_rollout_data(data_path, split_path, context_frames=4, num_seeds=10, 
 # ============================================================
 
 def load_discrete_wm(ckpt_path, tokenizer_path, device):
-    from models.discrete_diffusion import DiscreteWorldModel, PatchVQVAE
-
     tok_ckpt = torch.load(tokenizer_path, map_location=device, weights_only=False)
     tok_args = tok_ckpt['args']
     tokenizer = PatchVQVAE(
@@ -387,7 +499,6 @@ def load_discrete_wm(ckpt_path, tokenizer_path, device):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     model_args = ckpt.get('args', {})
     context_frames = model_args.get('context_frames', 1)
-    import math
     grid_size = int(math.sqrt(tok_args.get('num_patches', 256)))
     if grid_size == 0:
         grid_size = 16
@@ -410,9 +521,6 @@ def load_discrete_wm(ckpt_path, tokenizer_path, device):
 
 
 def load_diamond_wm(ckpt_path, device, num_actions=4):
-    from models.diffusion import Denoiser, DenoiserConfig
-    from models.diffusion.inner_model import InnerModelConfig
-
     inner_cfg = InnerModelConfig(
         img_channels=3,
         num_steps_conditioning=4,
@@ -430,7 +538,6 @@ def load_diamond_wm(ckpt_path, device, num_actions=4):
     denoiser = Denoiser(denoiser_cfg).to(device)
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    from collections import OrderedDict
     if isinstance(ckpt, dict) and any(k.startswith('denoiser.') for k in ckpt.keys()):
         den_sd = OrderedDict({k.split(".", 1)[1]: v for k, v in ckpt.items() if k.startswith("denoiser")})
         denoiser.load_state_dict(den_sd)
@@ -442,7 +549,6 @@ def load_diamond_wm(ckpt_path, device, num_actions=4):
 
 
 def load_idm(ckpt_path, device):
-    from train_idm import IDM
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     num_actions = ckpt.get('num_actions', 4)
     model = IDM(num_actions).to(device)
@@ -467,7 +573,7 @@ def main():
     parser.add_argument("--output-json", default="/vast/adi/discrete_wm/figures/ablation_v1/comparison.json")
     parser.add_argument("--context-frames", type=int, default=4)
     parser.add_argument("--n-quality-samples", type=int, default=1000)
-    parser.add_argument("--n-rollout-seeds", type=int, default=10)
+    parser.add_argument("--n-rollout-seeds", type=int, default=50)
     parser.add_argument("--n-idm-samples", type=int, default=200)
     parser.add_argument("--skip-diamond", action="store_true")
     parser.add_argument("--skip-discrete", action="store_true")
@@ -526,6 +632,16 @@ def main():
         for k, v in sorted(lh.items()):
             print(f"{k}: {v:.2f}")
 
+        print("\n--- FVD (16-step rollouts) ---")
+        try:
+            fvd_r = eval_fvd(adapter, rollout_ctx, rollout_acts, rollout_gts, device,
+                             rollout_len=16, n_rollouts=min(50, len(rollout_acts)))
+            r.update(fvd_r)
+            print(f"FVD: {fvd_r['fvd']:.1f}")
+        except Exception as e:
+            print(f"FVD failed: {e}")
+            r['fvd'] = None
+
         if idm is not None:
             print("\n--- IDM action F1 ---")
             idm_r = eval_idm_f1(adapter, idm, test_ctx, test_act, device, args.n_idm_samples)
@@ -535,7 +651,9 @@ def main():
         print("\n--- Inference FPS ---")
         fps = eval_fps(adapter, test_ctx, device)
         r.update(fps)
-        print(f"FPS: {fps['fps']:.1f}, ms/frame: {fps['ms_per_frame']:.1f}")
+        for k, v in sorted(fps.items()):
+            if k.startswith('fps'):
+                print(f"  {k}: {v:.1f}")
 
         results[name] = r
 

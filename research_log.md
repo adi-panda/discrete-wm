@@ -409,5 +409,112 @@ Retraining on new data for 50k steps. Training in progress.
 - Speed: ~17 steps/sec → ~1.6h estimated
 - Both models training on same GPU: 21 GB / 82 GB total, 100% util
 
+## Phase 2 Complete: Discrete WM Training
+**Timestamp**: 2026-04-20 ~08:30 UTC
+
+### Training Results
+- **100,000 steps** completed in 10,485s (~2.9h)
+- Final loss (CE): **1.25e-5** (converged very well)
+- Mean mask ratio: 0.66 (cosine schedule)
+- Checkpoints saved at: 20k, 40k, 60k, 80k, 100k steps + best + latest
+- Best checkpoint: `model_best.pt`
+
+### Loss Trajectory
+| Step | Loss | Notes |
+|------|------|-------|
+| 1,000 | 0.043 | Rapid initial descent |
+| 5,000 | 0.011 | |
+| 10,000 | 0.006 | |
+| 20,000 | 0.003 | |
+| 50,000 | 0.0002 | |
+| 100,000 | 1.25e-5 | Fully converged |
+
 ---
+
+
+---
+
+## Resume Note: 2026-04-20 ~17:40 UTC (user-initiated)
+
+**Observed failure:** DIAMOND training process (PID 132226) has been alive but idle at 0% GPU / 0% CPU for ~12 hours. CSV log frozen at step 20000 / 100000. Root cause: the training command was invoked with a trailing `2>&1 | head -5` pipe. Once `head` closed its stdin, the python process received SIGPIPE on its next write to stdout and silently stopped progressing without exiting.
+
+**Action taken by user:** killing zombie processes, relaunching the agent. Updated `instructions.md` with a RESUME MODE block at the top containing the exact correct invocation (no piped stdout; nohup + `> logfile 2>&1 &`).
+
+**State on disk at resume time:**
+- Our WM: `model_best.pt` + `model_step_100000.pt` + intermediate 20k/40k/60k/80k (DONE, loss 1.25e-5)
+- DIAMOND: only `diamond_step_020000.pt` (20k/100k, needs restart to 100k)
+- Tokenizer: `tokenizer_final.pt` (49.1 dB PSNR, 62% codebook util)
+- IDM: `idm.pt` (89.9% test acc, macro F1 0.92)
+- Data + split: intact under `/vast/adi/discrete_wm/data/ablation_v1/`
+
+**Agent must NOT redo Phases 0–2 or 4.** Pick up at Phase 3 (DIAMOND training) and proceed through Phase 5 (eval) and Phase 6 (write-up).
+
+---
+
+## Resume: 2026-04-20 ~17:40 UTC
+
+### Phase 3 (Restart): DIAMOND Training
+**Timestamp**: 2026-04-20 17:42 UTC
+
+- Fixed missing dependencies: `omegaconf`, `wandb`, `scikit-learn` (lost during env reset)
+- Restarted DIAMOND denoiser training from scratch (no --resume flag available)
+- Config: 100k steps, bs=32, lr=1e-4 cosine, channels=[64,64,64,64], 4-frame conditioning
+- Parameters: 4.4M (denoiser only)
+- Training speed: ~22 steps/sec, ETA ~75 min
+- Loss at 16k: 0.000292 (converging well)
+- Training in background, PID written to diamond.pid
+
+### Phase 5 Prep: Eval Harness Fixes
+**Timestamp**: 2026-04-20 17:45 UTC
+
+- Fixed `models` namespace conflict between our package and DIAMOND's via import ordering
+- Added FVD computation using InceptionV3 features + Frechet distance
+- Updated rollout data loader to sample multiple seeds per episode (needed 50 for FVD)
+- End-to-end test passed on our discrete WM:
+  - Quick test (20 samples): PSNR 52.3 dB, SSIM 0.999, LPIPS 0.0002
+  - DIAMOND 20k checkpoint test: PSNR 41.2 dB (undertrained, expected)
+- Parameter counts: Our WM 48.5M (48.1M WM + 0.4M tokenizer), DIAMOND 4.4M
+
+### Phase 3 Complete: DIAMOND Training
+**Timestamp**: 2026-04-20 ~19:00 UTC
+
+- 100,000 steps in 4662s (1.3h)
+- Final loss: 2.7e-5 (well converged)
+- Checkpoints: diamond_step_{020000,040000,060000,080000,100000}.pt + diamond_final.pt
+- Training speed: ~21.5 steps/sec
+
+### Phase 5 Complete: Unified Evaluation
+**Timestamp**: 2026-04-20 ~19:30 UTC
+
+Full results on 1000 test samples (next-frame) and 50 rollout seeds:
+
+| Metric | DIAMOND | Ours |
+|---|---|---|
+| Next-frame PSNR | **50.41** ± 6.38 | 49.10 ± 3.37 |
+| Next-frame SSIM | 0.9957 | **0.9989** |
+| Next-frame LPIPS | 0.0010 | **0.0003** |
+| FVD (16-step) | 0.91 | **0.41** |
+| IDM F1 | 0.724 | 0.716 |
+| Rollout PSNR @ 10 | 35.85 | **47.98** |
+| Rollout PSNR @ 50 | 26.30 | **43.13** |
+| FPS (best) | 34.0 | 34.2 |
+| Params | **4.4M** | 48.5M |
+
+**Key finding**: Discrete diffusion provides +16.8 dB long-horizon stability advantage at step 50 (43.1 vs 26.3 dB). Continuous diffusion wins slightly on single-step PSNR (+1.3 dB) but suffers compounding drift under autoregressive rollout.
+
+### Phase 6 Complete: Write-up
+**Timestamp**: 2026-04-20 ~19:35 UTC
+
+- `comparison.md` written with full ablation table, per-metric analysis, caveats
+- `README.md` updated with pointer
+- `comparison.json` saved with all raw numbers
+- Rollout GIFs saved to `figures/ablation_v1/rollouts_cmp/`
+
+### Success Criteria (ablation-v1)
+1. ✅ ≥100k frames collected via pretrained DIAMOND agent
+2. ✅ Our discrete WM trained 100k steps with 4-frame context
+3. ✅ DIAMOND trained 100k steps on identical static dataset
+4. ✅ IDM trained with 89.9% test acc
+5. ✅ evaluate_ablation.py runs both models through identical metrics
+6. ✅ comparison.md written with ablation table and caveats
 
