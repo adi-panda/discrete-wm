@@ -13,9 +13,6 @@ checkpoints/
 # Logs
 logs/
 
-# Figures / evaluation outputs
-figures/
-
 # Data files
 *.npz
 discrete_wm/data/
